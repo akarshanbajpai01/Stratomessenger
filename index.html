@@ -102,6 +102,14 @@ header {
     opacity: 0.7;
 }
 
+.message img {
+    display: block;
+    max-width: 100%;
+    max-height: 300px;
+    border-radius: 8px;
+    cursor: pointer;
+}
+
 #messageForm {
     display: flex;
     padding: 10px;
@@ -116,6 +124,81 @@ header {
 #messageForm button {
     background: black;
     color: white;
+}
+
+#messageForm button#camBtn {
+    background: #eee;
+    color: black;
+    padding: 14px 16px;
+}
+
+/* Camera overlay */
+
+#camOverlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    background: black;
+    flex-direction: column;
+}
+
+#camStage {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+#camVideo,
+#camPreview {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+}
+
+#camVideo.mirror {
+    transform: scaleX(-1);
+}
+
+#camPreview {
+    display: none;
+}
+
+.camBar {
+    display: flex;
+    justify-content: space-around;
+    align-items: center;
+    padding: 18px 10px calc(18px + env(safe-area-inset-bottom));
+    background: black;
+}
+
+.camBar button {
+    background: #333;
+    color: white;
+    min-width: 90px;
+}
+
+#snapBtn {
+    width: 70px;
+    height: 70px;
+    border-radius: 50%;
+    background: white;
+    border: 5px solid #888;
+    padding: 0;
+    min-width: 0;
+}
+
+#sendPhotoBtn {
+    background: #25a244;
+}
+
+#camError {
+    color: white;
+    padding: 20px;
+    text-align: center;
+    display: none;
 }
 </style>
 
@@ -158,6 +241,10 @@ header {
 
     <form id="messageForm">
 
+        <button type="button" id="camBtn" aria-label="Open camera">
+            &#128247;
+        </button>
+
         <input
             type="text"
             id="messageInput"
@@ -174,13 +261,43 @@ header {
 </div>
 
 
+<!-- CAMERA OVERLAY -->
+
+<div id="camOverlay">
+
+    <div id="camStage">
+        <video id="camVideo" autoplay playsinline muted></video>
+        <img id="camPreview" alt="Preview">
+        <div id="camError"></div>
+    </div>
+
+    <!-- live view controls -->
+    <div class="camBar" id="liveBar">
+        <button type="button" id="camCloseBtn">Cancel</button>
+        <button type="button" id="snapBtn" aria-label="Capture"></button>
+        <button type="button" id="flipBtn">&#128260; Flip</button>
+    </div>
+
+    <!-- preview controls -->
+    <div class="camBar" id="previewBar" style="display:none">
+        <button type="button" id="retakeBtn">Retake</button>
+        <button type="button" id="sendPhotoBtn">Send</button>
+    </div>
+
+</div>
+
+
 <script>
 
 /* =========================
    CONFIGURATION
 ========================= */
 
-const API_URL = "https://script.google.com/macros/s/AKfycbx2pBQa38W6jne5kwNVEnfGvnxewiJ-fqY9TLFzuSOklv5ZH1KDyoBmFdYdK2YkDuQN/exec";
+const API_URL = "https://script.google.com/macros/s/AKfycbzCLGwV3q2jPAn6jb_Wgt-msavOEGYMzLz-VOPYighqhRNaDH90CrPNtRvP-oH-3ELJ/exec";
+
+const IMG_PREFIX = "[img]";     // image messages are stored as "[img]<url>"
+const MAX_PHOTO_WIDTH = 900;    // px, keeps uploads small
+const PHOTO_QUALITY = 0.7;      // jpeg quality
 
 
 /* =========================
@@ -248,6 +365,8 @@ function openChat() {
    LOAD MESSAGES
 ========================= */
 
+let lastSnapshot = "";
+
 async function loadMessages() {
 
     try {
@@ -257,6 +376,13 @@ async function loadMessages() {
 
         const messages =
             await response.json();
+
+        // Skip re-render if nothing changed (prevents image flicker)
+        const snapshot = JSON.stringify(messages);
+
+        if (snapshot === lastSnapshot) return;
+
+        lastSnapshot = snapshot;
 
         messagesContainer.innerHTML = "";
 
@@ -281,15 +407,42 @@ async function loadMessages() {
             sender.textContent =
                 msg.sender;
 
-            const text =
-                document.createElement("div");
-
-            text.textContent =
-                msg.message;
-
             messageDiv.appendChild(sender);
 
-            messageDiv.appendChild(text);
+            const content = String(msg.message || "");
+
+            if (content.startsWith(IMG_PREFIX)) {
+
+                const url = content.slice(IMG_PREFIX.length);
+
+                const img = document.createElement("img");
+
+                img.src = url;
+                img.loading = "lazy";
+                img.alt = "Photo";
+
+                img.onload = () => {
+                    messagesContainer.scrollTop =
+                        messagesContainer.scrollHeight;
+                };
+
+                img.onclick = () => window.open(
+                    url.replace(/sz=w\d+/, "sz=w2000"),
+                    "_blank"
+                );
+
+                messageDiv.appendChild(img);
+
+            } else {
+
+                const text =
+                    document.createElement("div");
+
+                text.textContent = content;
+
+                messageDiv.appendChild(text);
+
+            }
 
             messagesContainer.appendChild(
                 messageDiv
@@ -364,6 +517,208 @@ messageForm.addEventListener(
     }
 
 );
+
+
+/* =========================
+   CAMERA (in-page, nothing saved to gallery)
+========================= */
+
+const camOverlay = document.getElementById("camOverlay");
+const camVideo = document.getElementById("camVideo");
+const camPreview = document.getElementById("camPreview");
+const camError = document.getElementById("camError");
+const liveBar = document.getElementById("liveBar");
+const previewBar = document.getElementById("previewBar");
+const sendPhotoBtn = document.getElementById("sendPhotoBtn");
+
+let camStream = null;
+let facing = "environment";   // back camera first
+let capturedDataUrl = null;
+
+
+async function startCamera() {
+
+    stopStream();
+
+    camError.style.display = "none";
+    camVideo.style.display = "block";
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        showCamError("Camera is not supported in this browser (or the page is not on HTTPS).");
+        return;
+    }
+
+    try {
+
+        camStream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { ideal: facing } },
+            audio: false
+        });
+
+        camVideo.srcObject = camStream;
+
+        // mirror the preview only for the front camera
+        camVideo.classList.toggle("mirror", facing === "user");
+
+    }
+
+    catch (error) {
+
+        console.error("Camera error:", error);
+
+        showCamError(
+            error.name === "NotAllowedError"
+                ? "Camera permission was denied. Allow camera access in your browser settings and try again."
+                : "Could not open the camera: " + error.message
+        );
+
+    }
+
+}
+
+
+function showCamError(text) {
+    camVideo.style.display = "none";
+    camError.textContent = text;
+    camError.style.display = "block";
+}
+
+
+function stopStream() {
+
+    if (camStream) {
+        camStream.getTracks().forEach(t => t.stop());
+        camStream = null;
+    }
+
+    camVideo.srcObject = null;
+}
+
+
+function showLiveView() {
+
+    capturedDataUrl = null;
+
+    camPreview.style.display = "none";
+    camVideo.style.display = "block";
+
+    previewBar.style.display = "none";
+    liveBar.style.display = "flex";
+
+    startCamera();
+}
+
+
+function openCamera() {
+
+    camOverlay.style.display = "flex";
+
+    showLiveView();
+}
+
+
+function closeCamera() {
+
+    stopStream();
+
+    capturedDataUrl = null;
+
+    camOverlay.style.display = "none";
+}
+
+
+function capturePhoto() {
+
+    if (!camVideo.videoWidth) return;
+
+    const scale = Math.min(1, MAX_PHOTO_WIDTH / camVideo.videoWidth);
+
+    const canvas = document.createElement("canvas");
+
+    canvas.width = Math.round(camVideo.videoWidth * scale);
+    canvas.height = Math.round(camVideo.videoHeight * scale);
+
+    canvas.getContext("2d").drawImage(
+        camVideo, 0, 0, canvas.width, canvas.height
+    );
+
+    capturedDataUrl = canvas.toDataURL("image/jpeg", PHOTO_QUALITY);
+
+    // freeze on the captured frame
+    stopStream();
+
+    camVideo.style.display = "none";
+
+    camPreview.src = capturedDataUrl;
+    camPreview.style.display = "block";
+
+    liveBar.style.display = "none";
+    previewBar.style.display = "flex";
+}
+
+
+async function sendPhoto() {
+
+    if (!capturedDataUrl) return;
+
+    sendPhotoBtn.disabled = true;
+    sendPhotoBtn.textContent = "Sending...";
+
+    try {
+
+        await fetch(API_URL, {
+
+            method: "POST",
+
+            body: JSON.stringify({
+
+                sender: username,
+
+                image: capturedDataUrl
+
+            })
+
+        });
+
+        closeCamera();
+
+        loadMessages();
+
+    }
+
+    catch (error) {
+
+        console.error("Could not send photo:", error);
+
+        alert("Could not send the photo. Please try again.");
+
+    }
+
+    finally {
+
+        sendPhotoBtn.disabled = false;
+        sendPhotoBtn.textContent = "Send";
+
+    }
+
+}
+
+
+document.getElementById("camBtn").addEventListener("click", openCamera);
+document.getElementById("camCloseBtn").addEventListener("click", closeCamera);
+document.getElementById("snapBtn").addEventListener("click", capturePhoto);
+document.getElementById("retakeBtn").addEventListener("click", showLiveView);
+sendPhotoBtn.addEventListener("click", sendPhoto);
+
+document.getElementById("flipBtn").addEventListener("click", () => {
+    facing = facing === "user" ? "environment" : "user";
+    startCamera();
+});
+
+// release the camera if the tab is hidden
+document.addEventListener("visibilitychange", () => {
+    if (document.hidden && camStream) stopStream();
+});
 
 
 /* =========================
